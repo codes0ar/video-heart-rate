@@ -23,9 +23,12 @@ class FacePulseTracker(
         val r = ArrayList<Float>()
         val g = ArrayList<Float>()
         val b = ArrayList<Float>()
-        var bpm = Double.NaN
+        var bpm = Double.NaN        // CHROM（EMA 平滑后）
+        var posBpm = Double.NaN     // POS（EMA 平滑后）
         var snr = 0.0
         var waveform: FloatArray? = null
+        var lastResult: SignalProcessor.PulseResult? = null
+        var lastBrightness = Float.NaN
         var sinceCompute = 0
 
         val durationMs: Long
@@ -67,6 +70,7 @@ class FacePulseTracker(
             val rgb = sampler(innerRoi(t.box))
             if (rgb != null) {
                 t.ts.add(nowMs); t.r.add(rgb[0]); t.g.add(rgb[1]); t.b.add(rgb[2])
+                t.lastBrightness = (rgb[0] + rgb[1] + rgb[2]) / 3f
                 while (t.ts.size > 2 && t.ts.first() < nowMs - windowMs) {
                     t.ts.removeAt(0); t.r.removeAt(0); t.g.removeAt(0); t.b.removeAt(0)
                 }
@@ -80,16 +84,16 @@ class FacePulseTracker(
     fun recompute(t: Track) {
         t.sinceCompute = 0
         if (t.durationMs < 5_000L || t.ts.size < 40) return
-        val fps = (t.ts.size - 1) * 1000.0 / t.durationMs
-        val res = SignalProcessor.compute(t.r, t.g, t.b, fps) ?: return
-        t.bpm = if (t.bpm.isNaN() || abs(t.bpm - res.bpm) > 12.0) {
-            res.bpm
-        } else {
-            0.65 * t.bpm + 0.35 * res.bpm
-        }
-        t.snr = res.snr
-        t.waveform = res.waveform
+        val res = SignalProcessor.compute(t.r, t.g, t.b, t.ts) ?: return
+        t.bpm = ema(t.bpm, res.chrom.bpm)
+        t.posBpm = ema(t.posBpm, res.pos.bpm)
+        t.snr = res.chrom.snr
+        t.waveform = res.chrom.waveform
+        t.lastResult = res
     }
+
+    private fun ema(prev: Double, new: Double): Double =
+        if (prev.isNaN() || abs(prev - new) > 12.0) new else 0.65 * prev + 0.35 * new
 
     private fun centerDist(a: RectF, b: RectF): Float {
         val dx = a.centerX() - b.centerX()

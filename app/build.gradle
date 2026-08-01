@@ -3,6 +3,18 @@ plugins {
     id 'org.jetbrains.kotlin.android'
 }
 
+// 版本号跟随 git：versionName = "1.0." + (提交数 - 1)，每次提交自动 +1
+def commitCount = {
+    try {
+        def p = ['git', 'rev-list', '--count', 'HEAD'].execute(null, rootDir)
+        p.waitFor()
+        def t = p.text.trim()
+        return t.isInteger() ? t.toInteger() : 1
+    } catch (Exception ignored) {
+        return 1
+    }
+}()
+
 android {
     namespace 'com.example.videohr'
     compileSdk 35
@@ -11,8 +23,12 @@ android {
         applicationId "com.example.videohr"
         minSdk 24
         targetSdk 35
-        versionCode 1
-        versionName "1.0"
+        versionCode commitCount
+        versionName "1.0.${commitCount - 1}"
+    }
+
+    buildFeatures {
+        buildConfig true
     }
 
     buildTypes {

@@ -32,6 +32,7 @@ class VideoActivity : AppCompatActivity() {
     private data class Summary(
         val id: Int,
         val bpm: Double,
+        val posBpm: Double,
         val snr: Double,
         val frames: Int,
         val waveform: FloatArray?,
@@ -142,7 +143,7 @@ class VideoActivity : AppCompatActivity() {
         return tracker.tracks
             .filter { it.durationMs >= 5_000L }
             .sortedBy { it.id }
-            .map { Summary(it.id, it.bpm, it.snr, it.ts.size, it.waveform) }
+            .map { Summary(it.id, it.bpm, it.posBpm, it.snr, it.ts.size, it.waveform) }
     }
 
     private fun meanRgb(bmp: Bitmap, roi: RectF): FloatArray? {
@@ -174,10 +175,10 @@ class VideoActivity : AppCompatActivity() {
         for (s in results) {
             val color = OverlayView.colorFor(s.id)
             val tv = TextView(this).apply {
-                text = if (s.bpm.isNaN()) {
+                text = if (s.bpm.isNaN() && s.posBpm.isNaN()) {
                     "人物 ${s.id}：信号不足，无法估算"
                 } else {
-                    "人物 ${s.id}：${s.bpm.roundToInt()} BPM（${MainActivity.confidence(s.snr)}，${s.frames} 帧）"
+                    "人物 ${s.id}：CHROM ${s.bpm.roundToInt()} / POS ${s.posBpm.roundToInt()} BPM（${MainActivity.confidence(s.snr)}，${s.frames} 帧）"
                 }
                 textSize = 18f
                 setTextColor(color)

@@ -5,7 +5,10 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.RectF
 import android.os.Bundle
+import android.util.Log
+import android.view.View
 import android.widget.Button
+import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
@@ -34,6 +37,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var previewView: PreviewView
     private lateinit var overlay: OverlayView
     private lateinit var statusText: TextView
+    private lateinit var debugText: TextView
+    private lateinit var waveContainer: LinearLayout
     private lateinit var torchBtn: Button
 
     private var camera: Camera? = null
@@ -65,6 +70,8 @@ class MainActivity : AppCompatActivity() {
         previewView = findViewById(R.id.previewView)
         overlay = findViewById(R.id.overlayView)
         statusText = findViewById(R.id.statusText)
+        debugText = findViewById(R.id.debugText)
+        waveContainer = findViewById(R.id.waveContainer)
         torchBtn = findViewById(R.id.torchBtn)
         previewView.keepScreenOn = true
 
@@ -155,7 +162,7 @@ class MainActivity : AppCompatActivity() {
         val items = tracks.map { t ->
             val mapped = mapToView(t.box, rotation, bufW, bufH)
             val label = if (t.bpm.isNaN()) "P${t.id} 测量中…"
-            else "P${t.id} ${t.bpm.roundToInt()} BPM"
+            else "P${t.id} C:${t.bpm.roundToInt()} P:${t.posBpm.roundToInt()}"
             OverlayView.Item(mapped, label, OverlayView.colorFor(t.id))
         }
         overlay.setItems(items)
@@ -164,8 +171,99 @@ class MainActivity : AppCompatActivity() {
             tracks.isEmpty() -> "未检测到人脸"
             tracks.all { it.bpm.isNaN() } -> "检测到 ${tracks.size} 张人脸，信号采集中（约需 8 秒）…"
             else -> tracks.joinToString("   ") { t ->
-                if (t.bpm.isNaN()) "P${t.id}: 测量中" else "P${t.id}: ${t.bpm.roundToInt()} BPM（${confidence(t.snr)}）"
+                if (t.bpm.isNaN()) "P${t.id}: 测量中"
+                else "P${t.id}: CHROM ${t.bpm.roundToInt()} / POS ${t.posBpm.roundToInt()}"
             }
+        }
+
+        renderDebug(tracks)
+    }
+
+    // ---- 调试信息：帮助判断心率是否误判 ----
+
+    private val waveViews = HashMap<Int, TrackDebugView>()
+
+    private fun renderDebug(tracks: List<FacePulseTracker.Track>) {
+        if (tracks.isEmpty()) {
+            debugText.visibility = View.GONE
+            waveContainer.removeAllViews()
+            waveViews.clear()
+            return
+        }
+        debugText.visibility = View.VISIBLE
+        val sb = StringBuilder()
+        sb.append("v").append(BuildConfig.VERSION_NAME).append('\n')
+        for (t in tracks) {
+            val bright = t.lastBrightness
+            val brightNote = when {
+                bright.isNaN() -> ""
+                bright > 235f -> " 过曝!"
+                bright < 45f -> " 太暗!"
+                else -> ""
+            }
+            val res = t.lastResult
+            if (res == null) {
+                sb.append("P${t.id} 采样${t.ts.size}帧 亮=${bright.roundToInt()}$brightNote\n")
+            } else {
+                val c = res.chrom
+                val p = res.pos
+                val peaks = c.topPeaks.joinToString(" ") { (f, m) -> "%.2f(%.2f)".format(f, m) }
+                sb.append(
+                    "P${t.id} C:%.1fHz=%dBPM SNR=%.2f P:%.1fHz=%dBPM SNR=%.2f | fps=%.1f n=%d 亮=%d%s | 峰Hz(C): %s | 通道R%.2f G1 B%.2f\n".format(
+                        c.freqHz, c.bpm.roundToInt(), c.snr,
+                        p.freqHz, p.bpm.roundToInt(), p.snr,
+                        res.fps, res.samples, bright.roundToInt(), brightNote, peaks,
+                        res.channelPulse[0], res.channelPulse[2]
+                    )
+                )
+                Log.d(
+                    TAG,
+                    "P${t.id} chrom=%.1f(%.3fHz,snr=%.2f) pos=%.1f(%.3fHz,snr=%.2f) fps=%.2f n=%d bright=%.0f chR=%.2f chB=%.2f peaks=$peaks".format(
+                        c.bpm, c.freqHz, c.snr, p.bpm, p.freqHz, p.snr,
+                        res.fps, res.samples, bright,
+                        res.channelPulse[0], res.channelPulse[2]
+                    )
+                )
+            }
+        }
+        debugText.text = sb.toString().trimEnd()
+
+        // 每脸一块调试图表：RGB 颜色曲线 + 提取脉搏波 + 频谱与锁定峰
+        val ids = tracks.map { it.id }.toSet()
+        val stale = waveViews.keys.filter { it !in ids }
+        stale.forEach { id -> waveViews.remove(id)?.let { waveContainer.removeView(it) } }
+        for (t in tracks) {
+            val dv = waveViews.getOrPut(t.id) {
+                TrackDebugView(this).also {
+                    waveContainer.addView(
+                        it,
+                        LinearLayout.LayoutParams(
+                            LinearLayout.LayoutParams.MATCH_PARENT,
+                            (170 * resources.displayMetrics.density).toInt()
+                        )
+                    )
+                }
+            }
+            val res = t.lastResult
+            dv.trackColor = OverlayView.colorFor(t.id)
+            dv.title = if (t.bpm.isNaN()) "P${t.id} 采样中… ${t.ts.size}帧"
+            else "P${t.id} C:${t.bpm.roundToInt()}BPM P:${t.posBpm.roundToInt()}BPM SNR:%.2f/%.2f".format(
+                res?.chrom?.snr ?: 0.0, res?.pos?.snr ?: 0.0
+            )
+            dv.rgb = Triple(
+                FloatArray(t.r.size) { t.r[it] },
+                FloatArray(t.g.size) { t.g[it] },
+                FloatArray(t.b.size) { t.b[it] },
+            )
+            dv.pulse = res?.chrom?.waveform
+            dv.pulsePos = res?.pos?.waveform
+            dv.spectrum = res?.chrom?.spectrum
+            dv.spectrumPos = res?.pos?.spectrum
+            dv.spectrumLoHz = (res?.chrom?.spectrumLoHz ?: 0.75).toFloat()
+            dv.spectrumBinHz = (res?.chrom?.spectrumBinHz ?: 0.01).toFloat()
+            dv.peakHz = (res?.chrom?.freqHz ?: 0.0).toFloat()
+            dv.peakHzPos = (res?.pos?.freqHz ?: 0.0).toFloat()
+            dv.invalidate()
         }
     }
 
@@ -192,6 +290,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     companion object {
+        private const val TAG = "Rppg"
+
         fun confidence(snr: Double): String = when {
             snr > 0.5 -> "信号强"
             snr > 0.25 -> "信号中"
