@@ -30,6 +30,11 @@ class FacePulseTracker(
         var lastResult: SignalProcessor.PulseResult? = null
         var lastBrightness = Float.NaN
         var sinceCompute = 0
+        val bpmHistory = ArrayList<Pair<Long, Double>>()    // (时间戳, CHROM bpm)
+        val posHistory = ArrayList<Pair<Long, Double>>()    // (时间戳, POS bpm)
+        var stressScore = Double.NaN    // 紧张指数 0..100
+        var stressLevel = ""
+        var rmssdMs = Double.NaN
 
         val durationMs: Long
             get() = if (ts.size < 2) 0L else ts.last() - ts.first()
@@ -90,6 +95,27 @@ class FacePulseTracker(
         t.snr = res.chrom.snr
         t.waveform = res.chrom.waveform
         t.lastResult = res
+        // BPM 历史（画"脑门曲线"用，保留最近 25 秒）
+        val now = t.ts.last()
+        t.bpmHistory.add(now to t.bpm)
+        t.posHistory.add(now to t.posBpm)
+        while (t.bpmHistory.size > 2 && t.bpmHistory.first().first < now - 25_000L) {
+            t.bpmHistory.removeAt(0)
+        }
+        while (t.posHistory.size > 2 && t.posHistory.first().first < now - 25_000L) {
+            t.posHistory.removeAt(0)
+        }
+
+        // 紧张指数：基线取历史 BPM 的 15 分位（会话内个人静息估计）
+        if (t.bpmHistory.size >= 3) {
+            val sorted = t.bpmHistory.map { it.second }.sorted()
+            val baseline = sorted[(sorted.size * 0.15).toInt().coerceIn(0, sorted.size - 1)]
+            val stress = StressEstimator.estimate(t.bpm, baseline, res.chrom.waveform, res.fps)
+            t.stressScore = if (t.stressScore.isNaN()) stress.score
+            else 0.5 * t.stressScore + 0.5 * stress.score
+            t.stressLevel = StressEstimator.levelOf(t.stressScore)
+            t.rmssdMs = stress.rmssdMs ?: Double.NaN
+        }
     }
 
     private fun ema(prev: Double, new: Double): Double =

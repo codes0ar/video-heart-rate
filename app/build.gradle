@@ -3,15 +3,15 @@ plugins {
     id 'org.jetbrains.kotlin.android'
 }
 
-// 版本号跟随 git：versionName = "1.0." + (提交数 - 1)，每次提交自动 +1
+// 版本号跟随 git：versionName = "2.0." + (提交数 - 3)，每次提交自动 +1（第 3 次提交 = 2.0.0）
 def commitCount = {
     try {
         def p = ['git', 'rev-list', '--count', 'HEAD'].execute(null, rootDir)
         p.waitFor()
         def t = p.text.trim()
-        return t.isInteger() ? t.toInteger() : 1
+        return t.isInteger() ? t.toInteger() : 3
     } catch (Exception ignored) {
-        return 1
+        return 3
     }
 }()
 
@@ -24,7 +24,7 @@ android {
         minSdk 24
         targetSdk 35
         versionCode commitCount
-        versionName "1.0.${commitCount - 1}"
+        versionName "2.0.${commitCount - 3}"
     }
 
     buildFeatures {

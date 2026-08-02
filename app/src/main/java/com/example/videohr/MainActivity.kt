@@ -6,6 +6,7 @@ import android.content.pm.PackageManager
 import android.graphics.RectF
 import android.os.Bundle
 import android.util.Log
+import android.view.MotionEvent
 import android.view.View
 import android.widget.Button
 import android.widget.LinearLayout
@@ -98,6 +99,48 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // ---- 三指双击：切换调试信息显隐 ----
+
+    private var threeFingerDownAt = 0L
+    private var lastThreeFingerTapAt = 0L
+
+    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        when (ev.actionMasked) {
+            MotionEvent.ACTION_POINTER_DOWN -> {
+                if (ev.pointerCount == 3) threeFingerDownAt = ev.eventTime
+            }
+            MotionEvent.ACTION_UP -> {
+                if (threeFingerDownAt > 0) {
+                    val dur = ev.eventTime - threeFingerDownAt
+                    threeFingerDownAt = 0
+                    if (dur < 400) {
+                        val now = ev.eventTime
+                        if (now - lastThreeFingerTapAt < 700) {
+                            lastThreeFingerTapAt = 0
+                            toggleDebug()
+                        } else {
+                            lastThreeFingerTapAt = now
+                        }
+                    }
+                }
+            }
+        }
+        return super.dispatchTouchEvent(ev)
+    }
+
+    private fun toggleDebug() {
+        debugVisible = !debugVisible
+        if (!debugVisible) {
+            debugText.visibility = View.GONE
+            waveContainer.visibility = View.GONE
+        }
+        Toast.makeText(
+            this,
+            if (debugVisible) "调试信息：显示" else "调试信息：隐藏",
+            Toast.LENGTH_SHORT
+        ).show()
+    }
+
     private fun startCamera() {
         val future = ProcessCameraProvider.getInstance(this)
         future.addListener({
@@ -162,8 +205,23 @@ class MainActivity : AppCompatActivity() {
         val items = tracks.map { t ->
             val mapped = mapToView(t.box, rotation, bufW, bufH)
             val label = if (t.bpm.isNaN()) "P${t.id} 测量中…"
-            else "P${t.id} C:${t.bpm.roundToInt()} P:${t.posBpm.roundToInt()}"
-            OverlayView.Item(mapped, label, OverlayView.colorFor(t.id))
+            else {
+                val stress = if (t.stressLevel.isNotEmpty()) " ${t.stressLevel}" else ""
+                "P${t.id} C:${t.bpm.roundToInt()} P:${t.posBpm.roundToInt()}$stress"
+            }
+            if (t.bpmHistory.size >= 2) {
+                val c = FloatArray(t.bpmHistory.size) { t.bpmHistory[it].second.toFloat() }
+                val p = FloatArray(t.posHistory.size) { t.posHistory[it].second.toFloat() }
+                var mn = Float.MAX_VALUE
+                var mx = -Float.MAX_VALUE
+                for (v in c) { if (v < mn) mn = v; if (v > mx) mx = v }
+                for (v in p) { if (v < mn) mn = v; if (v > mx) mx = v }
+                mn -= 5f; mx += 5f
+                if (mx - mn < 20f) { val mid = (mx + mn) / 2f; mn = mid - 10f; mx = mid + 10f }
+                OverlayView.Item(mapped, label, OverlayView.colorFor(t.id), c, p, mn, mx)
+            } else {
+                OverlayView.Item(mapped, label, OverlayView.colorFor(t.id))
+            }
         }
         overlay.setItems(items)
 
@@ -172,25 +230,33 @@ class MainActivity : AppCompatActivity() {
             tracks.all { it.bpm.isNaN() } -> "检测到 ${tracks.size} 张人脸，信号采集中（约需 8 秒）…"
             else -> tracks.joinToString("   ") { t ->
                 if (t.bpm.isNaN()) "P${t.id}: 测量中"
-                else "P${t.id}: CHROM ${t.bpm.roundToInt()} / POS ${t.posBpm.roundToInt()}"
+                else {
+                    val stress = if (t.stressScore.isNaN()) ""
+                    else " ${t.stressLevel}(${t.stressScore.roundToInt()})"
+                    "P${t.id}: CHROM ${t.bpm.roundToInt()} / POS ${t.posBpm.roundToInt()}$stress"
+                }
             }
         }
 
         renderDebug(tracks)
     }
 
-    // ---- 调试信息：帮助判断心率是否误判 ----
+    // ---- 调试信息：帮助判断心率是否误判（默认隐藏，三指双击切换）----
 
     private val waveViews = HashMap<Int, TrackDebugView>()
+    private var debugVisible = false
 
     private fun renderDebug(tracks: List<FacePulseTracker.Track>) {
-        if (tracks.isEmpty()) {
+        if (!debugVisible || tracks.isEmpty()) {
             debugText.visibility = View.GONE
+            waveContainer.visibility = View.GONE
+            if (!debugVisible) return
             waveContainer.removeAllViews()
             waveViews.clear()
             return
         }
         debugText.visibility = View.VISIBLE
+        waveContainer.visibility = View.VISIBLE
         val sb = StringBuilder()
         sb.append("v").append(BuildConfig.VERSION_NAME).append('\n')
         for (t in tracks) {
@@ -209,11 +275,13 @@ class MainActivity : AppCompatActivity() {
                 val p = res.pos
                 val peaks = c.topPeaks.joinToString(" ") { (f, m) -> "%.2f(%.2f)".format(f, m) }
                 sb.append(
-                    "P${t.id} C:%.1fHz=%dBPM SNR=%.2f P:%.1fHz=%dBPM SNR=%.2f | fps=%.1f n=%d 亮=%d%s | 峰Hz(C): %s | 通道R%.2f G1 B%.2f\n".format(
+                    "P${t.id} C:%.1fHz=%dBPM SNR=%.2f P:%.1fHz=%dBPM SNR=%.2f | fps=%.1f n=%d 亮=%d%s | 峰Hz(C): %s | 通道R%.2f G1 B%.2f | 压力=%.0f(%s) RMSSD=%s\n".format(
                         c.freqHz, c.bpm.roundToInt(), c.snr,
                         p.freqHz, p.bpm.roundToInt(), p.snr,
                         res.fps, res.samples, bright.roundToInt(), brightNote, peaks,
-                        res.channelPulse[0], res.channelPulse[2]
+                        res.channelPulse[0], res.channelPulse[2],
+                        t.stressScore, t.stressLevel,
+                        if (t.rmssdMs.isNaN()) "--" else "%.0fms".format(t.rmssdMs)
                     )
                 )
                 Log.d(
