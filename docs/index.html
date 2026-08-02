@@ -1,0 +1,1048 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>视频心率（网页版）</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; background: #000; overflow: hidden;
+    font-family: system-ui, sans-serif; color: #fff; }
+  #stage { position: fixed; inset: 0; }
+  video#cam { position: absolute; inset: 0; width: 100%; height: 100%;
+    object-fit: cover; background: #000; }
+  video#cam.mirror { transform: scaleX(-1); }
+  canvas#overlay { position: absolute; inset: 0; width: 100%; height: 100%; }
+  #status { position: absolute; top: 0; left: 0; right: 0; padding: 10px;
+    background: rgba(0,0,0,.4); text-align: center; font-size: 14px; z-index: 5; }
+  #debugText { position: absolute; top: 44px; left: 0; right: 0; padding: 6px;
+    background: rgba(0,0,0,.35); color: #A5D6A7; font: 10px/1.5 monospace;
+    white-space: pre-wrap; z-index: 5; display: none; }
+  #debugCharts { position: absolute; left: 0; right: 0; bottom: 64px;
+    background: rgba(0,0,0,.2); z-index: 4; display: none; }
+  #debugCharts canvas { display: block; width: 100%; height: 150px; }
+  #controls { position: absolute; bottom: 0; left: 0; right: 0; display: flex;
+    gap: 8px; padding: 12px; background: rgba(0,0,0,.4); z-index: 6; }
+  #controls button { flex: 1; padding: 10px 4px; font-size: 14px; border: 0;
+    border-radius: 6px; background: #333; color: #fff; }
+  #controls button:active { background: #555; }
+  #controls button.on { background: #E91E63; }
+  #fileVideo { display: none; }
+  #resultPanel { position: absolute; inset: 0; background: rgba(0,0,0,.92);
+    z-index: 10; padding: 20px; overflow-y: auto; display: none; }
+  #resultPanel h2 { font-size: 18px; margin-bottom: 12px; }
+  #resultPanel .person { margin: 14px 0; font-size: 16px; }
+  #resultPanel canvas { display: block; width: 100%; height: 110px;
+    background: rgba(255,255,255,.05); margin-top: 6px; }
+  #resultPanel button { margin-top: 16px; padding: 10px 20px; font-size: 15px;
+    border: 0; border-radius: 6px; background: #E91E63; color: #fff; }
+  #hint { position: absolute; bottom: 64px; left: 0; right: 0; text-align: center;
+    font-size: 11px; color: rgba(255,255,255,.45); z-index: 3; padding: 4px; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <video id="cam" autoplay playsinline muted></video>
+  <canvas id="overlay"></canvas>
+  <div id="status">正在初始化人脸检测模型…</div>
+  <div id="debugText"></div>
+  <div id="debugCharts"></div>
+  <div id="hint">三指双击或按 D 键切换调试信息 · 结果仅供娱乐参考，非医疗诊断</div>
+  <div id="controls">
+    <button id="torchBtn">补光灯</button>
+    <button id="switchBtn">切换镜头</button>
+    <button id="videoBtn">相册视频</button>
+    <button id="debugBtn">调试</button>
+  </div>
+  <video id="fileVideo" playsinline muted></video>
+  <input type="file" id="fileInput" accept="video/*" style="display:none">
+  <div id="resultPanel"></div>
+</div>
+
+<script type="module">
+import { FaceLandmarker, FilesetResolver }
+  from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+const VERSION = "2.0.1-web";
+
+/* ============================================================
+ * 信号处理：CHROM + POS + FFT（Android 版 SignalProcessor 移植）
+ * ==========================================================*/
+
+const MIN_HZ = 0.75, MAX_HZ = 3.0;
+
+function std(x) {
+  let mean = 0;
+  for (const v of x) mean += v;
+  mean /= x.length;
+  let acc = 0;
+  for (const v of x) { const d = v - mean; acc += d * d; }
+  return Math.sqrt(acc / x.length);
+}
+
+function detrend(x) {
+  const n = x.length;
+  let sx = 0, sy = 0, sxx = 0, sxy = 0;
+  for (let i = 0; i < n; i++) { sx += i; sy += x[i]; sxx += i * i; sxy += i * x[i]; }
+  const denom = n * sxx - sx * sx;
+  const out = new Float64Array(n);
+  if (Math.abs(denom) < 1e-9) {
+    const mean = sy / n;
+    for (let i = 0; i < n; i++) out[i] = x[i] - mean;
+    return out;
+  }
+  const slope = (n * sxy - sx * sy) / denom;
+  const intercept = (sy - slope * sx) / n;
+  for (let i = 0; i < n; i++) out[i] = x[i] - (slope * i + intercept);
+  return out;
+}
+
+/** 按时间戳线性插值为均匀采样并均值归一；均值≈0 返回 null */
+function resample(x, ts, stepMs) {
+  const n = ts.length;
+  let mean = 0;
+  for (const v of x) mean += v;
+  mean /= n;
+  if (mean < 1e-6) return null;
+  const t0 = ts[0];
+  const out = new Float64Array(n);
+  let j = 0;
+  for (let i = 0; i < n; i++) {
+    const t = i * stepMs;
+    while (j < n - 2 && ts[j + 1] - t0 < t) j++;
+    const ta = ts[j] - t0, tb = ts[j + 1] - t0;
+    const w = tb > ta ? Math.min(1, Math.max(0, (t - ta) / (tb - ta))) : 0;
+    out[i] = (x[j] * (1 - w) + x[j + 1] * w) / mean;
+  }
+  return out;
+}
+
+/** 迭代基-2 FFT（原地），长度为 2 的幂 */
+function fft(re, im) {
+  const n = re.length;
+  let j = 0;
+  for (let i = 1; i < n; i++) {
+    let bit = n >> 1;
+    while (j & bit) { j ^= bit; bit >>= 1; }
+    j |= bit;
+    if (i < j) {
+      let t = re[i]; re[i] = re[j]; re[j] = t;
+      t = im[i]; im[i] = im[j]; im[j] = t;
+    }
+  }
+  for (let len = 2; len <= n; len <<= 1) {
+    const ang = -2 * Math.PI / len;
+    const wr = Math.cos(ang), wi = Math.sin(ang);
+    for (let i = 0; i < n; i += len) {
+      let curR = 1, curI = 0;
+      for (let k = 0; k < len / 2; k++) {
+        const aR = re[i + k], aI = im[i + k];
+        const bR = re[i + k + len / 2] * curR - im[i + k + len / 2] * curI;
+        const bI = re[i + k + len / 2] * curI + im[i + k + len / 2] * curR;
+        re[i + k] = aR + bR; im[i + k] = aI + bI;
+        re[i + k + len / 2] = aR - bR; im[i + k + len / 2] = aI - bI;
+        const tR = curR * wr - curI * wi;
+        curI = curR * wi + curI * wr;
+        curR = tR;
+      }
+    }
+  }
+}
+
+function ifft(re, im) {
+  const n = re.length;
+  for (let i = 0; i < n; i++) im[i] = -im[i];
+  fft(re, im);
+  for (let i = 0; i < n; i++) { re[i] /= n; im[i] = -im[i] / n; }
+}
+
+/** 去趋势 → Hann FFT → 频带峰值/SNR/波形/频谱 */
+function analyze(sRaw, fps, m, lo, hi) {
+  const n = sRaw.length;
+  const s = detrend(sRaw);
+  const re = new Float64Array(m), im = new Float64Array(m);
+  for (let i = 0; i < n; i++) {
+    const w = 0.5 * (1 - Math.cos(2 * Math.PI * i / (n - 1)));
+    re[i] = s[i] * w;
+  }
+  fft(re, im);
+  const binHz = fps / m;
+  const mags = new Float64Array(m / 2 + 1);
+  for (let i = 0; i <= m / 2; i++) mags[i] = re[i] * re[i] + im[i] * im[i];
+
+  let peak = lo, peakMag = 0;
+  for (let i = lo; i <= hi; i++) {
+    if (mags[i] > peakMag) { peakMag = mags[i]; peak = i; }
+  }
+  if (peakMag <= 0) return null;
+
+  let freq = peak * binHz;
+  if (peak > lo && peak < hi) {
+    const y0 = Math.sqrt(mags[peak - 1]), y1 = Math.sqrt(mags[peak]), y2 = Math.sqrt(mags[peak + 1]);
+    const d = (y2 - y0) / (2 * (2 * y1 - y0 - y2) + 1e-12);
+    if (isFinite(d) && Math.abs(d) < 1) freq = (peak + d) * binHz;
+  }
+
+  let near = 0, total = 0;
+  for (let i = lo; i <= hi; i++) {
+    total += mags[i];
+    if (Math.abs(i - peak) <= 2) near += mags[i];
+  }
+  const snr = total > 0 ? near / total : 0;
+
+  const peaks = [];
+  for (let i = lo + 1; i < hi; i++) {
+    if (mags[i] >= mags[i - 1] && mags[i] >= mags[i + 1]) peaks.push([i, mags[i]]);
+  }
+  const topPeaks = peaks.sort((a, b) => b[1] - a[1]).slice(0, 3)
+    .sort((a, b) => a[0] - b[0])
+    .map(([i, mag]) => [i * binHz, Math.sqrt(mag / peakMag)]);
+
+  const wre = new Float64Array(m), wim = new Float64Array(m);
+  for (let i = lo; i <= hi; i++) {
+    wre[i] = re[i]; wim[i] = im[i];
+    wre[m - i] = re[m - i]; wim[m - i] = im[m - i];
+  }
+  ifft(wre, wim);
+  const wave = new Float32Array(n);
+  for (let i = 0; i < n; i++) wave[i] = wre[i];
+  const spectrum = new Float32Array(hi - lo + 1);
+  for (let i = 0; i <= hi - lo; i++) spectrum[i] = Math.sqrt(mags[lo + i] / peakMag);
+
+  return { bpm: freq * 60, snr, waveform: wave, freqHz: freq,
+    topPeaks, spectrum, spectrumLoHz: lo * binHz, spectrumBinHz: binHz };
+}
+
+function bandPeak(x, m, lo, hi) {
+  const n = x.length;
+  const re = new Float64Array(m), im = new Float64Array(m);
+  for (let i = 0; i < n; i++) {
+    const w = 0.5 * (1 - Math.cos(2 * Math.PI * i / (n - 1)));
+    re[i] = x[i] * w;
+  }
+  fft(re, im);
+  let mx = 0;
+  for (let i = lo; i <= hi; i++) {
+    const p = re[i] * re[i] + im[i] * im[i];
+    if (p > mx) mx = p;
+  }
+  return Math.sqrt(mx);
+}
+
+/** 主入口：同时计算 CHROM 与 POS */
+function computePulse(r, g, b, ts) {
+  const n0 = ts.length;
+  if (n0 < 48) return null;
+  const durMs = ts[n0 - 1] - ts[0];
+  if (durMs < 4000) return null;
+  const fps = (n0 - 1) * 1000 / durMs;
+  if (fps < 5) return null;
+
+  const n = n0, step = durMs / (n - 1);
+  const rs = resample(r, ts, step), gs = resample(g, ts, step), bs = resample(b, ts, step);
+  if (!rs || !gs || !bs) return null;
+
+  const xs = new Float64Array(n), ys = new Float64Array(n);
+  for (let i = 0; i < n; i++) { xs[i] = 3 * rs[i] - 2 * gs[i]; ys[i] = 1.5 * rs[i] + gs[i] - 1.5 * bs[i]; }
+  const sy = std(ys);
+  if (sy < 1e-9) return null;
+  const alphaC = std(xs) / sy;
+  const sChrom = new Float64Array(n);
+  for (let i = 0; i < n; i++) sChrom[i] = xs[i] - alphaC * ys[i];
+
+  const p1 = new Float64Array(n), p2 = new Float64Array(n);
+  for (let i = 0; i < n; i++) { p1[i] = gs[i] - bs[i]; p2[i] = -2 * rs[i] + gs[i] + bs[i]; }
+  const sp2 = std(p2);
+  if (sp2 < 1e-9) return null;
+  const alphaP = std(p1) / sp2;
+  const sPos = new Float64Array(n);
+  for (let i = 0; i < n; i++) sPos[i] = p1[i] + alphaP * p2[i];
+
+  let m = 1;
+  while (m < n * 2) m <<= 1;
+  m = Math.min(m, 8192);
+  const binHz = fps / m;
+  const lo = Math.max(1, Math.floor(MIN_HZ / binHz));
+  const hi = Math.min(m / 2, Math.round(MAX_HZ / binHz) + 1);
+  if (hi <= lo) return null;
+
+  const chrom = analyze(sChrom, fps, m, lo, hi);
+  const pos = analyze(sPos, fps, m, lo, hi);
+  if (!chrom || !pos) return null;
+
+  const greenD = detrend(gs);
+  const chG = bandPeak(greenD, m, lo, hi);
+  const channelPulse = chG > 1e-12
+    ? [bandPeak(detrend(rs), m, lo, hi) / chG, 1, bandPeak(detrend(bs), m, lo, hi) / chG]
+    : [0, 1, 0];
+
+  return { chrom, pos, fps, samples: n,
+    green: Float32Array.from(greenD), channelPulse };
+}
+
+/* ============================================================
+ * 紧张指数（StressEstimator 移植）
+ * ==========================================================*/
+
+function rmssdMs(w, fps) {
+  if (w.length < 16 || fps < 5) return null;
+  let mx = 1e-6;
+  for (const v of w) mx = Math.max(mx, Math.abs(v));
+  const thr = mx * 0.35;
+  const minGap = Math.max(1, Math.floor(fps * 0.4));
+  const peaks = [];
+  let i = 1;
+  while (i < w.length - 1) {
+    if (w[i] >= w[i - 1] && w[i] >= w[i + 1] && w[i] > thr) {
+      if (peaks.length === 0 || i - peaks[peaks.length - 1] >= minGap) {
+        peaks.push(i); i += minGap; continue;
+      }
+    }
+    i++;
+  }
+  if (peaks.length < 4) return null;
+  const ibis = [];
+  for (let k = 1; k < peaks.length; k++) {
+    const ibi = (peaks[k] - peaks[k - 1]) * 1000 / fps;
+    if (ibi >= 350 && ibi <= 1500) ibis.push(ibi);
+  }
+  if (ibis.length < 3) return null;
+  let acc = 0, cnt = 0;
+  for (let k = 1; k < ibis.length; k++) {
+    const d = ibis[k] - ibis[k - 1];
+    acc += d * d; cnt++;
+  }
+  return cnt ? Math.sqrt(acc / cnt) : null;
+}
+
+function stressLevelOf(score) {
+  if (score <= 25) return "心平气和";
+  if (score <= 50) return "稍有慌张";
+  if (score <= 75) return "明显紧张";
+  return "极度紧张";
+}
+
+function estimateStress(bpm, baselineBpm, waveform, fps) {
+  const delta = Math.max(0, bpm - baselineBpm);
+  const rmssd = waveform ? rmssdMs(waveform, fps) : null;
+  const hrScore = Math.min(1, delta / 20);
+  const score = rmssd != null
+    ? hrScore * 60 + Math.min(1, Math.max(0, (50 - rmssd) / 35)) * 40
+    : hrScore * 100;
+  return { score: Math.min(100, Math.max(0, score)), level: stressLevelOf(score), delta, rmssd };
+}
+
+/* ============================================================
+ * 多人脸跟踪 + 活体判断（FacePulseTracker 移植）
+ * ==========================================================*/
+
+const TEXTURE_HIGH = 18.0;
+
+function innerRoi(f) {
+  const w = f.right - f.left, h = f.bottom - f.top;
+  return { left: f.left + 0.22 * w, top: f.top + 0.08 * h,
+    right: f.right - 0.22 * w, bottom: f.top + 0.62 * h };
+}
+
+function centerDist(a, b) {
+  const dx = (a.left + a.right) / 2 - (b.left + b.right) / 2;
+  const dy = (a.top + a.bottom) / 2 - (b.top + b.bottom) / 2;
+  return Math.sqrt(dx * dx + dy * dy);
+}
+
+class Track {
+  constructor(id) {
+    this.id = id;
+    this.box = null;
+    this.lastSeen = 0;
+    this.ts = []; this.r = []; this.g = []; this.b = [];
+    this.bpm = NaN; this.posBpm = NaN;
+    this.snr = 0; this.waveform = null; this.lastResult = null;
+    this.lastBrightness = NaN;
+    this.sinceCompute = 0;
+    this.bpmHistory = []; this.posHistory = [];
+    this.stressScore = NaN; this.stressLevel = ""; this.rmssdMs = NaN;
+    this.liveness = ""; this.livenessDebug = "";
+    this.texEma = NaN; this.blinkCount = 0; this.eyeClosed = false;
+    this.motionHist = [];
+  }
+  get durationMs() {
+    return this.ts.length < 2 ? 0 : this.ts[this.ts.length - 1] - this.ts[0];
+  }
+}
+
+class FacePulseTracker {
+  constructor(maxTracks = 4, windowMs = 12000, staleMs = 1200) {
+    this.maxTracks = maxTracks;
+    this.windowMs = windowMs;
+    this.staleMs = staleMs;
+    this.tracks = [];
+    this.nextId = 1;
+  }
+
+  update(faces, nowMs, sampler) {
+    const used = new Set();
+    for (const f of faces) {
+      let best = null, bestD = Infinity;
+      for (const t of this.tracks) {
+        if (used.has(t) || !t.box) continue;
+        const d = centerDist(t.box, f.box);
+        if (d < bestD) { bestD = d; best = t; }
+      }
+      const fw = f.box.right - f.box.left, fh = f.box.bottom - f.box.top;
+      const threshold = Math.max(fw, fh) * 0.6 +
+        (best ? Math.max(best.box.right - best.box.left, best.box.bottom - best.box.top) * 0.4 : 0);
+      let t;
+      if (best && bestD < threshold) t = best;
+      else if (this.tracks.length < this.maxTracks) {
+        t = new Track(this.nextId++);
+        this.tracks.push(t);
+      } else continue;
+
+      used.add(t);
+      if (t.box) {
+        t.box = {
+          left: (t.box.left + f.box.left) / 2, top: (t.box.top + f.box.top) / 2,
+          right: (t.box.right + f.box.right) / 2, bottom: (t.box.bottom + f.box.bottom) / 2,
+        };
+      } else t.box = { ...f.box };
+      t.lastSeen = nowMs;
+
+      if (f.eyeOpen != null) {
+        if (!t.eyeClosed && f.eyeOpen < 0.3) t.eyeClosed = true;
+        else if (t.eyeClosed && f.eyeOpen > 0.7) { t.eyeClosed = false; t.blinkCount++; }
+      }
+
+      const cx = (t.box.left + t.box.right) / 2, cy = (t.box.top + t.box.bottom) / 2;
+      t.motionHist.push([nowMs, cx, cy, t.box.right - t.box.left]);
+      while (t.motionHist.length > 2 && t.motionHist[0][0] < nowMs - 10000) t.motionHist.shift();
+
+      const rgb = sampler(innerRoi(t.box));
+      if (rgb) {
+        t.ts.push(nowMs); t.r.push(rgb[0]); t.g.push(rgb[1]); t.b.push(rgb[2]);
+        t.lastBrightness = (rgb[0] + rgb[1] + rgb[2]) / 3;
+        if (rgb.length >= 4) {
+          t.texEma = isNaN(t.texEma) ? rgb[3] : 0.9 * t.texEma + 0.1 * rgb[3];
+        }
+        while (t.ts.length > 2 && t.ts[0] < nowMs - this.windowMs) {
+          t.ts.shift(); t.r.shift(); t.g.shift(); t.b.shift();
+        }
+        t.sinceCompute++;
+      }
+    }
+    this.tracks = this.tracks.filter(t => used.has(t) || nowMs - t.lastSeen <= this.staleMs);
+    return this.tracks;
+  }
+
+  recompute(t) {
+    t.sinceCompute = 0;
+    if (t.durationMs < 5000 || t.ts.length < 40) return;
+    const res = computePulse(t.r, t.g, t.b, t.ts);
+    if (!res) return;
+    t.bpm = this.ema(t.bpm, res.chrom.bpm);
+    t.posBpm = this.ema(t.posBpm, res.pos.bpm);
+    t.snr = res.chrom.snr;
+    t.waveform = res.chrom.waveform;
+    t.lastResult = res;
+
+    const now = t.ts[t.ts.length - 1];
+    t.bpmHistory.push([now, t.bpm]);
+    t.posHistory.push([now, t.posBpm]);
+    while (t.bpmHistory.length > 2 && t.bpmHistory[0][0] < now - 25000) t.bpmHistory.shift();
+    while (t.posHistory.length > 2 && t.posHistory[0][0] < now - 25000) t.posHistory.shift();
+
+    if (t.bpmHistory.length >= 3) {
+      const sorted = t.bpmHistory.map(e => e[1]).sort((a, b) => a - b);
+      const baseline = sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.15))];
+      const st = estimateStress(t.bpm, baseline, res.chrom.waveform, res.fps);
+      t.stressScore = isNaN(t.stressScore) ? st.score : 0.5 * t.stressScore + 0.5 * st.score;
+      t.stressLevel = stressLevelOf(t.stressScore);
+      t.rmssdMs = st.rmssd ?? NaN;
+    }
+
+    this.updateLiveness(t);
+  }
+
+  updateLiveness(t) {
+    const res = t.lastResult;
+    if (!res) return;
+    if (t.durationMs < 10000) { t.liveness = "识别中…"; return; }
+    const c = res.chrom;
+    const pulseOk = c.snr > 0.30 && res.channelPulse[0] < 0.85 && res.channelPulse[2] < 0.95;
+    const texHigh = !isNaN(t.texEma) && t.texEma > TEXTURE_HIGH;
+    const mot = this.motionStd(t);
+    const veryStatic = mot != null && mot < 0.004;
+
+    if (pulseOk && texHigh) t.liveness = "疑似视频回放";
+    else if (pulseOk) t.liveness = "真人";
+    else if (t.blinkCount === 0 && veryStatic) t.liveness = "这是照片吗？";
+    else if (t.blinkCount === 0) t.liveness = "疑似照片";
+    else t.liveness = "真人？";
+
+    t.livenessDebug = `pulse=${pulseOk} tex=${t.texEma.toFixed(1)}(${texHigh ? "高" : "低"}) ` +
+      `blink=${t.blinkCount} mot=${mot == null ? "--" : mot.toFixed(4)}`;
+  }
+
+  motionStd(t) {
+    const h = t.motionHist;
+    if (h.length < 10) return null;
+    const stdOf = (sel) => {
+      let mean = 0;
+      for (const e of h) mean += sel(e);
+      mean /= h.length;
+      let acc = 0;
+      for (const e of h) { const d = sel(e) - mean; acc += d * d; }
+      return Math.sqrt(acc / h.length);
+    };
+    return (stdOf(e => e[1] / e[3]) + stdOf(e => e[2] / e[3])) / 2;
+  }
+
+  ema(prev, val) {
+    return (isNaN(prev) || Math.abs(prev - val) > 12) ? val : 0.65 * prev + 0.35 * val;
+  }
+}
+
+const TRACK_COLORS = ["#4CAF50", "#00BCD4", "#FFC107", "#E91E63"];
+const colorFor = (id) => TRACK_COLORS[(id - 1) % TRACK_COLORS.length];
+const confidence = (snr) => snr > 0.5 ? "信号强" : snr > 0.25 ? "信号中" : "信号弱";
+
+/* ============================================================
+ * MediaPipe 人脸检测 + 相机管理
+ * ==========================================================*/
+
+const cam = document.getElementById("cam");
+const overlay = document.getElementById("overlay");
+const octx = overlay.getContext("2d");
+const statusEl = document.getElementById("status");
+const debugText = document.getElementById("debugText");
+const debugCharts = document.getElementById("debugCharts");
+const fileVideo = document.getElementById("fileVideo");
+const resultPanel = document.getElementById("resultPanel");
+
+const sampleCanvas = document.createElement("canvas");
+const sctx = sampleCanvas.getContext("2d", { willReadFrequently: true });
+
+let landmarker = null;
+let facing = "environment";
+let stream = null;
+let torchOn = false;
+let mode = "camera";            // camera | file
+let debugVisible = false;
+const tracker = new FacePulseTracker();
+
+async function initModel() {
+  const fileset = await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+  landmarker = await FaceLandmarker.createFromOptions(fileset, {
+    baseOptions: {
+      modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
+      delegate: "GPU",
+    },
+    runningMode: "VIDEO",
+    numFaces: 4,
+    outputFaceBlendshapes: true,
+  });
+}
+
+async function startCamera() {
+  if (stream) stream.getTracks().forEach(tr => tr.stop());
+  stream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: facing, width: { ideal: 640 }, height: { ideal: 480 } },
+    audio: false,
+  });
+  cam.srcObject = stream;
+  cam.classList.toggle("mirror", facing === "user");
+  await cam.play();
+  if (torchOn) applyTorch(true);
+}
+
+async function applyTorch(on) {
+  try {
+    const track = stream?.getVideoTracks()[0];
+    await track.applyConstraints({ advanced: [{ torch: on }] });
+  } catch (e) { /* 多数桌面/iOS 不支持，忽略 */ }
+}
+
+/* ============================================================
+ * 帧采样：mean RGB + 屏幕纹理（mean|Laplacian| on luma）
+ * ==========================================================*/
+
+function drawFrame(video) {
+  const w = video.videoWidth, h = video.videoHeight;
+  if (!w || !h) return false;
+  if (sampleCanvas.width !== w) { sampleCanvas.width = w; sampleCanvas.height = h; }
+  sctx.drawImage(video, 0, 0, w, h);
+  return true;
+}
+
+function sampleROI(roi) {
+  const W = sampleCanvas.width, H = sampleCanvas.height;
+  const l = Math.max(0, Math.min(W - 2, Math.round(roi.left)));
+  const t = Math.max(0, Math.min(H - 2, Math.round(roi.top)));
+  const r = Math.max(l + 1, Math.min(W - 1, Math.round(roi.right)));
+  const b = Math.max(t + 1, Math.min(H - 1, Math.round(roi.bottom)));
+  if (r <= l || b <= t) return null;
+  const img = sctx.getImageData(l, t, r - l, b - t).data;
+  const rw = r - l, rh = b - t;
+  let sr = 0, sg = 0, sb = 0;
+  const cnt = rw * rh;
+  const luma = new Float32Array(cnt);
+  for (let i = 0, p = 0; i < cnt; i++, p += 4) {
+    sr += img[p]; sg += img[p + 1]; sb += img[p + 2];
+    luma[i] = 0.299 * img[p] + 0.587 * img[p + 1] + 0.114 * img[p + 2];
+  }
+  // 纹理：中心 64×64 mean|Laplacian|
+  let texSum = 0, texCnt = 0;
+  const x0 = Math.max(1, Math.floor(rw / 2 - 32)), x1 = Math.min(rw - 1, x0 + 64);
+  const y0 = Math.max(1, Math.floor(rh / 2 - 32)), y1 = Math.min(rh - 1, y0 + 64);
+  for (let y = y0; y < y1; y++) {
+    for (let x = x0; x < x1; x++) {
+      const c = luma[y * rw + x];
+      const lap = 4 * c - luma[y * rw + x - 1] - luma[y * rw + x + 1]
+        - luma[(y - 1) * rw + x] - luma[(y + 1) * rw + x];
+      texSum += Math.abs(lap); texCnt++;
+    }
+  }
+  return [sr / cnt, sg / cnt, sb / cnt, texCnt ? texSum / texCnt : 0];
+}
+
+/* ============================================================
+ * 分析主循环
+ * ==========================================================*/
+
+let lastVideoTime = -1;
+
+function activeVideo() { return mode === "camera" ? cam : fileVideo; }
+
+function analyzeLoop() {
+  requestAnimationFrame(analyzeLoop);
+  if (!landmarker) return;
+  const video = activeVideo();
+  if (video.readyState < 2 || video.paused) return;
+
+  const nowMs = mode === "file" ? video.currentTime * 1000 : performance.now();
+  if (nowMs === lastVideoTime) return;
+  lastVideoTime = nowMs;
+
+  const vw = video.videoWidth, vh = video.videoHeight;
+  let result;
+  try {
+    result = landmarker.detectForVideo(video, mode === "file" ? nowMs : nowMs);
+  } catch (e) { return; }
+
+  const faces = [];
+  const lms = result.faceLandmarks || [];
+  for (let idx = 0; idx < lms.length; idx++) {
+    const lm = lms[idx];
+    let minX = 1, minY = 1, maxX = 0, maxY = 0;
+    for (const p of lm) {
+      if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x;
+      if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y;
+    }
+    let eye = null;
+    const bs = result.faceBlendshapes?.[idx]?.categories;
+    if (bs) {
+      const bl = bs.find(c => c.categoryName === "eyeBlinkLeft")?.score;
+      const br = bs.find(c => c.categoryName === "eyeBlinkRight")?.score;
+      if (bl != null && br != null) eye = 1 - (bl + br) / 2;
+    }
+    faces.push({
+      box: { left: minX * vw, top: minY * vh, right: maxX * vw, bottom: maxY * vh },
+      eyeOpen: eye,
+    });
+  }
+
+  if (!drawFrame(video)) return;
+  const tracks = tracker.update(faces, nowMs, sampleROI);
+  for (const t of tracks) {
+    if (t.sinceCompute >= 30) tracker.recompute(t);
+  }
+  render(tracks, video);
+}
+
+/* ============================================================
+ * 渲染：人脸框 + 额头心率曲线 + 状态栏 + 调试区
+ * ==========================================================*/
+
+function mapToScreen(box, video) {
+  const sw = overlay.width, sh = overlay.height;
+  const vw = video.videoWidth, vh = video.videoHeight;
+  const scale = Math.max(sw / vw, sh / vh);
+  const dx = (sw - vw * scale) / 2, dy = (sh - vh * scale) / 2;
+  let l = box.left * scale + dx, r = box.right * scale + dx;
+  const t = box.top * scale + dy, b = box.bottom * scale + dy;
+  if (mode === "camera" && facing === "user") { const nl = sw - r; r = sw - l; l = nl; }
+  return { left: l, top: t, right: r, bottom: b };
+}
+
+function render(tracks, video) {
+  // 尺寸自适应
+  if (overlay.width !== overlay.clientWidth) {
+    overlay.width = overlay.clientWidth;
+    overlay.height = overlay.clientHeight;
+  }
+  octx.clearRect(0, 0, overlay.width, overlay.height);
+  octx.font = "bold 15px system-ui";
+  octx.lineWidth = 2.5;
+
+  for (const t of tracks) {
+    const m = mapToScreen(t.box, video);
+    const color = colorFor(t.id);
+    octx.strokeStyle = color;
+    octx.strokeRect(m.left, m.top, m.right - m.left, m.bottom - m.top);
+
+    const liveTag = t.liveness && t.liveness !== "识别中…" ? `【${t.liveness}】` : "";
+    const label = isNaN(t.bpm) ? `P${t.id} 测量中…${liveTag}`
+      : `P${t.id} C:${Math.round(t.bpm)} P:${Math.round(t.posBpm)}` +
+        `${t.stressLevel ? " " + t.stressLevel : ""}${liveTag}`;
+
+    if (t.bpmHistory.length >= 2) {
+      drawForeheadChart(t, m, label, color);
+    } else {
+      const tw = octx.measureText(label).width;
+      let ly = m.top - 34;
+      if (ly < 0) ly = m.bottom + 6;
+      octx.fillStyle = "rgba(0,0,0,.65)";
+      octx.fillRect(m.left, ly, tw + 16, 28);
+      octx.fillStyle = "#fff";
+      octx.fillText(label, m.left + 8, ly + 20);
+    }
+  }
+
+  statusEl.textContent = tracks.length === 0 ? "未检测到人脸"
+    : tracks.every(t => isNaN(t.bpm)) ? `检测到 ${tracks.length} 张人脸，信号采集中（约需 8 秒）…`
+    : tracks.map(t => {
+        const live = t.liveness && t.liveness !== "识别中…" ? " " + t.liveness : "";
+        if (isNaN(t.bpm)) return `P${t.id}: 测量中${live}`;
+        const stress = isNaN(t.stressScore) ? "" : ` ${t.stressLevel}(${Math.round(t.stressScore)})`;
+        return `P${t.id}: CHROM ${Math.round(t.bpm)} / POS ${Math.round(t.posBpm)}${stress}${live}`;
+      }).join("   ");
+
+  renderDebug(tracks);
+}
+
+function drawForeheadChart(t, m, label, color) {
+  const cw = m.right - m.left;
+  const ch = Math.min((m.bottom - m.top) * 0.55, 90);
+  let top = m.top - ch - 6;
+  if (top < 0) top = m.top + 6;
+  octx.fillStyle = "rgba(0,0,0,.6)";
+  octx.fillRect(m.left, top, cw, ch);
+  octx.strokeStyle = color;
+  octx.lineWidth = 1.5;
+  octx.strokeRect(m.left, top, cw, ch);
+  octx.fillStyle = color;
+  octx.font = "bold 13px system-ui";
+  octx.fillText(label, m.left + 6, top + 17);
+
+  const all = t.bpmHistory.map(e => e[1]).concat(t.posHistory.map(e => e[1]));
+  let mn = Math.min(...all) - 5, mx = Math.max(...all) + 5;
+  if (mx - mn < 20) { const mid = (mx + mn) / 2; mn = mid - 10; mx = mid + 10; }
+  const areaTop = top + 24, areaBot = top + ch - 6;
+  octx.fillStyle = "rgba(255,255,255,.5)";
+  octx.font = "9px system-ui";
+  octx.fillText(Math.round(mx), m.left + 4, areaTop + 8);
+  octx.fillText(Math.round(mn), m.left + 4, areaBot);
+  octx.strokeStyle = "rgba(255,255,255,.25)";
+  octx.beginPath();
+  octx.moveTo(m.left, (areaTop + areaBot) / 2);
+  octx.lineTo(m.right, (areaTop + areaBot) / 2);
+  octx.stroke();
+
+  const drawCurve = (hist, col) => {
+    if (hist.length < 2) return;
+    octx.strokeStyle = col;
+    octx.lineWidth = 2;
+    octx.beginPath();
+    hist.forEach((e, i) => {
+      const x = m.right - (hist.length - 1 - i) / (hist.length - 1) * cw;
+      const y = areaBot - Math.min(1, Math.max(0, (e[1] - mn) / (mx - mn))) * (areaBot - areaTop);
+      i === 0 ? octx.moveTo(x, y) : octx.lineTo(x, y);
+    });
+    octx.stroke();
+  };
+  drawCurve(t.bpmHistory, color);
+  drawCurve(t.posHistory, "#FF9800");
+}
+
+/* ---- 调试区（默认隐藏）---- */
+
+const chartCanvases = new Map();
+
+function renderDebug(tracks) {
+  if (!debugVisible || tracks.length === 0) {
+    debugText.style.display = "none";
+    debugCharts.style.display = "none";
+    return;
+  }
+  debugText.style.display = "block";
+  debugCharts.style.display = "block";
+
+  let txt = "v" + VERSION + "\n";
+  for (const t of tracks) {
+    const bright = t.lastBrightness;
+    const brightNote = isNaN(bright) ? "" : bright > 235 ? " 过曝!" : bright < 45 ? " 太暗!" : "";
+    const res = t.lastResult;
+    if (!res) {
+      txt += `P${t.id} 采样${t.ts.length}帧 亮=${Math.round(bright)}${brightNote}\n`;
+    } else {
+      const c = res.chrom, p = res.pos;
+      const peaks = c.topPeaks.map(([f, m]) => `${f.toFixed(2)}(${m.toFixed(2)})`).join(" ");
+      txt += `P${t.id} C:${c.freqHz.toFixed(1)}Hz=${Math.round(c.bpm)}BPM SNR=${c.snr.toFixed(2)}` +
+        ` P:${p.freqHz.toFixed(1)}Hz=${Math.round(p.bpm)}BPM SNR=${p.snr.toFixed(2)}` +
+        ` | fps=${res.fps.toFixed(1)} n=${res.samples} 亮=${Math.round(bright)}${brightNote}` +
+        ` | 峰Hz(C): ${peaks} | 通道R${res.channelPulse[0].toFixed(2)} G1 B${res.channelPulse[2].toFixed(2)}` +
+        ` | 压力=${isNaN(t.stressScore) ? "--" : t.stressScore.toFixed(0)}(${t.stressLevel})` +
+        ` RMSSD=${isNaN(t.rmssdMs) ? "--" : t.rmssdMs.toFixed(0) + "ms"}\n`;
+      if (t.livenessDebug) txt += `   活体: ${t.liveness} | ${t.livenessDebug}\n`;
+    }
+  }
+  debugText.textContent = txt.trimEnd();
+
+  const ids = new Set(tracks.map(t => t.id));
+  for (const [id, cv] of chartCanvases) {
+    if (!ids.has(id)) { cv.remove(); chartCanvases.delete(id); }
+  }
+  for (const t of tracks) {
+    let cv = chartCanvases.get(t.id);
+    if (!cv) {
+      cv = document.createElement("canvas");
+      debugCharts.appendChild(cv);
+      chartCanvases.set(t.id, cv);
+    }
+    drawTrackChart(cv, t);
+  }
+}
+
+/** 调试图表：RGB 曲线 + 白/橙脉搏波 + 双频谱与锁定峰 */
+function drawTrackChart(cv, t) {
+  const W = cv.clientWidth, H = 150;
+  if (cv.width !== W) { cv.width = W; cv.height = H; }
+  const g = cv.getContext("2d");
+  g.clearRect(0, 0, W, H);
+  const res = t.lastResult;
+  const title = isNaN(t.bpm) ? `P${t.id} 采样中… ${t.ts.length}帧`
+    : `P${t.id} C:${Math.round(t.bpm)}BPM P:${Math.round(t.posBpm)}BPM` +
+      ` SNR:${(res?.chrom.snr ?? 0).toFixed(2)}/${(res?.pos.snr ?? 0).toFixed(2)}`;
+  g.font = "bold 12px system-ui";
+  g.fillStyle = colorFor(t.id);
+  g.fillText(title, 6, 16);
+
+  const chartTop = 22, chartMid = H * 0.60, chartBot = H - 14;
+
+  // RGB 曲线
+  if (t.r.length > 4) {
+    const half = (chartMid - chartTop) / 2, midY = chartTop + half;
+    g.strokeStyle = "rgba(255,255,255,.2)";
+    g.beginPath(); g.moveTo(0, midY); g.lineTo(W, midY); g.stroke();
+    let maxDev = 0.01;
+    for (const ch of [t.r, t.g, t.b]) {
+      const mean = ch.reduce((a, v) => a + v, 0) / ch.length;
+      if (mean <= 1e-6) continue;
+      for (const v of ch) {
+        const d = Math.abs((v - mean) / mean);
+        if (d > maxDev) maxDev = Math.min(0.10, d);
+      }
+    }
+    g.fillStyle = "rgba(255,255,255,.6)";
+    g.font = "9px system-ui";
+    g.fillText(`±${(maxDev * 100).toFixed(1)}%`, W - 42, chartTop + 10);
+    const drawCh = (data, col) => {
+      const mean = data.reduce((a, v) => a + v, 0) / data.length;
+      if (mean <= 1e-6) return;
+      g.strokeStyle = col; g.lineWidth = 1.5; g.beginPath();
+      data.forEach((v, i) => {
+        const dev = Math.max(-maxDev, Math.min(maxDev, (v - mean) / mean));
+        const x = i / (data.length - 1) * W;
+        const y = midY - dev / maxDev * half * 0.9;
+        i === 0 ? g.moveTo(x, y) : g.lineTo(x, y);
+      });
+      g.stroke();
+    };
+    drawCh(t.r, "#F44336"); drawCh(t.g, "#4CAF50"); drawCh(t.b, "#2196F3");
+    const drawPulse = (data, col) => {
+      if (!data || data.length <= 4) return;
+      let mx = 1e-6;
+      for (const v of data) mx = Math.max(mx, Math.abs(v));
+      g.strokeStyle = col; g.lineWidth = 1.5; g.beginPath();
+      for (let i = 0; i < data.length; i++) {
+        const x = i / (data.length - 1) * W;
+        const y = midY - data[i] / mx * half * 0.9;
+        i === 0 ? g.moveTo(x, y) : g.lineTo(x, y);
+      }
+      g.stroke();
+    };
+    drawPulse(res?.chrom.waveform, "#FFFFFF");
+    drawPulse(res?.pos.waveform, "#FF9800");
+  }
+
+  // 频谱
+  g.strokeStyle = "rgba(255,255,255,.2)";
+  g.beginPath(); g.moveTo(0, chartMid); g.lineTo(W, chartMid); g.stroke();
+  const lo = 0.75, hi = 3.0, span = chartBot - chartMid - 4;
+  const drawSpec = (sp, loHz, binHz, col) => {
+    if (!sp || sp.length <= 2) return;
+    g.strokeStyle = col; g.lineWidth = 1.5; g.beginPath();
+    let started = false;
+    for (let i = 0; i < sp.length; i++) {
+      const hz = loHz + i * binHz;
+      if (hz < lo || hz > hi) continue;
+      const x = (hz - lo) / (hi - lo) * W;
+      const y = chartBot - Math.min(1, Math.max(0, sp[i])) * span;
+      if (!started) { g.moveTo(x, y); started = true; } else g.lineTo(x, y);
+    }
+    g.stroke();
+  };
+  if (res) {
+    drawSpec(res.chrom.spectrum, res.chrom.spectrumLoHz, res.chrom.spectrumBinHz, "#FFFFFF");
+    drawSpec(res.pos.spectrum, res.pos.spectrumLoHz, res.pos.spectrumBinHz, "#FF9800");
+    g.strokeStyle = "rgba(255,255,255,.2)";
+    g.fillStyle = "rgba(255,255,255,.6)";
+    g.font = "9px system-ui";
+    for (const hz of [1, 2, 3]) {
+      const x = (hz - lo) / (hi - lo) * W;
+      g.beginPath(); g.moveTo(x, chartMid); g.lineTo(x, chartBot); g.stroke();
+      g.fillText(String(hz * 60), x - 8, H - 2);
+    }
+    const mark = (freq, col, tag, dy) => {
+      if (freq < lo || freq > hi) return;
+      const x = (freq - lo) / (hi - lo) * W;
+      g.strokeStyle = col; g.lineWidth = 2;
+      g.beginPath(); g.moveTo(x, chartMid); g.lineTo(x, chartBot); g.stroke();
+      g.fillStyle = col; g.font = "bold 10px system-ui";
+      g.fillText(`${tag}:${Math.round(freq * 60)}`, Math.min(W - 46, Math.max(0, x - 18)), chartMid + dy);
+    };
+    mark(res.chrom.freqHz, "#FFEB3B", "C", 10);
+    mark(res.pos.freqHz, "#FF9800", "P", 22);
+  }
+}
+
+/* ============================================================
+ * 相册视频模式
+ * ==========================================================*/
+
+const fileInput = document.getElementById("fileInput");
+
+function enterFileMode(file) {
+  mode = "file";
+  fileVideo.src = URL.createObjectURL(file);
+  tracker.tracks = [];
+  lastVideoTime = -1;
+  statusEl.textContent = "视频分析中（时长 = 视频长度，实时播放分析）…";
+  fileVideo.play();
+}
+
+fileVideo.addEventListener("ended", () => {
+  showFileResults();
+});
+
+function showFileResults() {
+  mode = "camera";
+  lastVideoTime = -1;
+  const list = tracker.tracks
+    .filter(t => t.durationMs >= 5000)
+    .sort((a, b) => a.id - b.id);
+  let html = `<h2>分析完成，检测到 ${list.length} 人（仅供参考）</h2>`;
+  if (list.length === 0) html += `<p>未检测到持续可见的人脸（需正脸持续 5 秒以上）</p>`;
+  resultPanel.innerHTML = html;
+  for (const t of list) {
+    const div = document.createElement("div");
+    div.className = "person";
+    div.style.color = colorFor(t.id);
+    const live = t.liveness ? ` ${t.liveness}` : "";
+    div.textContent = isNaN(t.bpm) && isNaN(t.posBpm)
+      ? `人物 ${t.id}：信号不足，无法估算${live}`
+      : `人物 ${t.id}：CHROM ${Math.round(t.bpm)} / POS ${Math.round(t.posBpm)} BPM` +
+        `（${confidence(t.snr)}，${t.ts.length} 帧）${live}`;
+    resultPanel.appendChild(div);
+    if (t.waveform) {
+      const cv = document.createElement("canvas");
+      resultPanel.appendChild(cv);
+      requestAnimationFrame(() => {
+        cv.width = cv.clientWidth; cv.height = 110;
+        const g = cv.getContext("2d");
+        const w = t.waveform;
+        let mx = 1e-6;
+        for (const v of w) mx = Math.max(mx, Math.abs(v));
+        g.strokeStyle = colorFor(t.id); g.lineWidth = 2; g.beginPath();
+        for (let i = 0; i < w.length; i++) {
+          const x = i / (w.length - 1) * cv.width;
+          const y = 55 - w[i] / mx * 46;
+          i === 0 ? g.moveTo(x, y) : g.lineTo(x, y);
+        }
+        g.stroke();
+      });
+    }
+  }
+  const back = document.createElement("button");
+  back.textContent = "返回相机";
+  back.onclick = () => { resultPanel.style.display = "none"; fileVideo.src = ""; };
+  resultPanel.appendChild(back);
+  resultPanel.style.display = "block";
+}
+
+/* ============================================================
+ * 按钮与手势
+ * ==========================================================*/
+
+document.getElementById("torchBtn").onclick = (e) => {
+  torchOn = !torchOn;
+  applyTorch(torchOn);
+  e.target.classList.toggle("on", torchOn);
+  e.target.textContent = torchOn ? "补光灯·开" : "补光灯";
+};
+document.getElementById("switchBtn").onclick = async () => {
+  facing = facing === "environment" ? "user" : "environment";
+  tracker.tracks = [];
+  await startCamera();
+};
+document.getElementById("videoBtn").onclick = () => fileInput.click();
+fileInput.onchange = () => { if (fileInput.files[0]) enterFileMode(fileInput.files[0]); };
+
+function toggleDebug() {
+  debugVisible = !debugVisible;
+  if (!debugVisible) {
+    debugText.style.display = "none";
+    debugCharts.style.display = "none";
+  }
+}
+document.getElementById("debugBtn").onclick = toggleDebug;
+document.addEventListener("keydown", (e) => {
+  if (e.key === "d" || e.key === "D") toggleDebug();
+});
+
+// 三指双击切换调试
+let threeFingerDownAt = 0, lastThreeFingerTap = 0;
+document.addEventListener("touchstart", (e) => {
+  if (e.touches.length === 3) threeFingerDownAt = performance.now();
+}, { passive: true });
+document.addEventListener("touchend", (e) => {
+  if (e.touches.length === 0 && threeFingerDownAt > 0) {
+    const dur = performance.now() - threeFingerDownAt;
+    threeFingerDownAt = 0;
+    if (dur < 400) {
+      const now = performance.now();
+      if (now - lastThreeFingerTap < 700) { lastThreeFingerTap = 0; toggleDebug(); }
+      else lastThreeFingerTap = now;
+    }
+  }
+}, { passive: true });
+
+/* ============================================================
+ * 启动
+ * ==========================================================*/
+
+(async () => {
+  try {
+    await initModel();
+    statusEl.textContent = "模型加载完成，正在打开相机…";
+    await startCamera();
+    statusEl.textContent = "对准人脸，保持静止";
+  } catch (e) {
+    statusEl.textContent = "初始化失败：" + e.message + "（需要相机权限与网络加载模型）";
+  }
+  analyzeLoop();
+})();
+</script>
+</body>
+</html>
