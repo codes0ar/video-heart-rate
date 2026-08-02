@@ -53,6 +53,7 @@ class MainActivity : AppCompatActivity() {
         FaceDetection.getClient(
             FaceDetectorOptions.Builder()
                 .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_FAST)
+                .setClassificationMode(FaceDetectorOptions.CLASSIFICATION_MODE_ALL)
                 .setMinFaceSize(0.15f)
                 .build()
         )
@@ -178,10 +179,20 @@ class MainActivity : AppCompatActivity() {
         detector.process(InputImage.fromMediaImage(mediaImage, rotation))
             .addOnSuccessListener(analysisExecutor) { faces ->
                 try {
-                    val boxes = faces.map { RectF(it.boundingBox) }
-                    val tracks = tracker.update(boxes, nowMs) { roiUpright ->
+                    val infos = faces.map { face ->
+                        val lo = face.leftEyeOpenProbability
+                        val ro = face.rightEyeOpenProbability
+                        val eye = when {
+                            lo != null && ro != null -> (lo + ro) / 2f
+                            lo != null -> lo
+                            ro != null -> ro
+                            else -> null
+                        }
+                        FacePulseTracker.FaceInfo(RectF(face.boundingBox), eye)
+                    }
+                    val tracks = tracker.update(infos, nowMs) { roiUpright ->
                         val roiBuf = CoordinateMap.uprightToBuffer(roiUpright, rotation, bufW, bufH)
-                        YuvRgb.meanRgb(proxy, roiBuf)
+                        YuvRgb.meanRgbAndTexture(proxy, roiBuf)
                     }
                     for (t in tracks) {
                         if (t.sinceCompute >= 30) tracker.recompute(t)
@@ -204,10 +215,11 @@ class MainActivity : AppCompatActivity() {
     ) {
         val items = tracks.map { t ->
             val mapped = mapToView(t.box, rotation, bufW, bufH)
-            val label = if (t.bpm.isNaN()) "P${t.id} 测量中…"
+            val liveTag = if (t.liveness.isNotEmpty() && t.liveness != "识别中…") "【${t.liveness}】" else ""
+            val label = if (t.bpm.isNaN()) "P${t.id} 测量中…$liveTag"
             else {
                 val stress = if (t.stressLevel.isNotEmpty()) " ${t.stressLevel}" else ""
-                "P${t.id} C:${t.bpm.roundToInt()} P:${t.posBpm.roundToInt()}$stress"
+                "P${t.id} C:${t.bpm.roundToInt()} P:${t.posBpm.roundToInt()}$stress$liveTag"
             }
             if (t.bpmHistory.size >= 2) {
                 val c = FloatArray(t.bpmHistory.size) { t.bpmHistory[it].second.toFloat() }
@@ -229,11 +241,12 @@ class MainActivity : AppCompatActivity() {
             tracks.isEmpty() -> "未检测到人脸"
             tracks.all { it.bpm.isNaN() } -> "检测到 ${tracks.size} 张人脸，信号采集中（约需 8 秒）…"
             else -> tracks.joinToString("   ") { t ->
-                if (t.bpm.isNaN()) "P${t.id}: 测量中"
+                val liveTag = if (t.liveness.isNotEmpty() && t.liveness != "识别中…") " ${t.liveness}" else ""
+                if (t.bpm.isNaN()) "P${t.id}: 测量中$liveTag"
                 else {
                     val stress = if (t.stressScore.isNaN()) ""
                     else " ${t.stressLevel}(${t.stressScore.roundToInt()})"
-                    "P${t.id}: CHROM ${t.bpm.roundToInt()} / POS ${t.posBpm.roundToInt()}$stress"
+                    "P${t.id}: CHROM ${t.bpm.roundToInt()} / POS ${t.posBpm.roundToInt()}$stress$liveTag"
                 }
             }
         }
@@ -284,6 +297,9 @@ class MainActivity : AppCompatActivity() {
                         if (t.rmssdMs.isNaN()) "--" else "%.0fms".format(t.rmssdMs)
                     )
                 )
+                if (t.livenessDebug.isNotEmpty()) {
+                    sb.append("   活体: ${t.liveness} | ${t.livenessDebug}\n")
+                }
                 Log.d(
                     TAG,
                     "P${t.id} chrom=%.1f(%.3fHz,snr=%.2f) pos=%.1f(%.3fHz,snr=%.2f) fps=%.2f n=%d bright=%.0f chR=%.2f chB=%.2f peaks=$peaks".format(

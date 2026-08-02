@@ -116,8 +116,8 @@ class VideoActivity : AppCompatActivity() {
             val nowMs = tUs / 1000
             try {
                 val faces = Tasks.await(detector.process(InputImage.fromBitmap(bmp, 0)))
-                val boxes = faces.map { RectF(it.boundingBox) }
-                val tracks = tracker.update(boxes, nowMs) { roi -> meanRgb(bmp, roi) }
+                val infos = faces.map { FacePulseTracker.FaceInfo(RectF(it.boundingBox)) }
+                val tracks = tracker.update(infos, nowMs) { roi -> meanRgb(bmp, roi) }
                 val interval = fps.toInt().coerceAtLeast(15)
                 for (tr in tracks) {
                     if (tr.sinceCompute >= interval) tracker.recompute(tr)

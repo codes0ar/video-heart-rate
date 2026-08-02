@@ -78,4 +78,51 @@ object YuvRgb {
             (ym + 1.772 * um).toFloat()
         )
     }
+
+    /**
+     * mean RGB + 屏幕纹理度量（第 4 分量）。
+     * 屏幕显示的图像带有像素网格，ROI 中心 64×64 内 Y 通道的 mean|Laplacian| 显著高于真实皮肤。
+     */
+    fun meanRgbAndTexture(image: ImageProxy, roi: RectF): FloatArray? {
+        val base = meanRgb(image, roi) ?: return null
+
+        val w = image.width
+        val h = image.height
+        var l = roi.left.roundToInt().coerceIn(1, w - 3)
+        var t = roi.top.roundToInt().coerceIn(1, h - 3)
+        var r = roi.right.roundToInt().coerceIn(l + 2, w - 2)
+        var b = roi.bottom.roundToInt().coerceIn(t + 2, h - 2)
+        // 限制在中心 64×64，避免过大 ROI 的开销
+        if (r - l > 64) { val c = (l + r) / 2; l = c - 32; r = c + 32 }
+        if (b - t > 64) { val c = (t + b) / 2; t = c - 32; b = c + 32 }
+
+        val yPlane = image.planes[0]
+        val yBuf = yPlane.buffer
+        val stride = yPlane.rowStride
+        val pxStride = yPlane.pixelStride
+
+        var sum = 0.0
+        var cnt = 0
+        var yy = t + 1
+        while (yy < b - 1) {
+            val row = yy * stride
+            val rowUp = (yy - 1) * stride
+            val rowDn = (yy + 1) * stride
+            var xx = l + 1
+            while (xx < r - 1) {
+                val c = yBuf.get(row + xx * pxStride).toInt() and 0xFF
+                val lap = 4 * c -
+                    (yBuf.get(row + (xx - 1) * pxStride).toInt() and 0xFF) -
+                    (yBuf.get(row + (xx + 1) * pxStride).toInt() and 0xFF) -
+                    (yBuf.get(rowUp + xx * pxStride).toInt() and 0xFF) -
+                    (yBuf.get(rowDn + xx * pxStride).toInt() and 0xFF)
+                sum += kotlin.math.abs(lap)
+                cnt++
+                xx++
+            }
+            yy++
+        }
+        val tex = if (cnt > 0) (sum / cnt).toFloat() else 0f
+        return floatArrayOf(base[0], base[1], base[2], tex)
+    }
 }
